@@ -73,3 +73,7 @@ websockets==15.0.1
 wheel==0.45.1
 xlsxwriter==3.2.9
 yt-dlp==2025.9.5
+deta==1.2.0
+greenlet==3.2.4
+playwright==1.55.0
+pyee==13.0.0
