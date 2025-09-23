@@ -1,39 +1,96 @@
 import os
-import requests
-from bs4 import BeautifulSoup
+import time
+import logging
+from urllib.parse import urljoin, urlparse
+
 from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from google import genai
 
-# ------------------- ENV + CLIENT -------------------
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+import asyncio
+import requests
+
+# ------------------- SETUP -------------------
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("❌ GEMINI_API_KEY not found in environment variables!")
-if not HUGGINGFACE_API_KEY:
-    raise ValueError("❌ HUGGINGFACE_API_KEY not found in environment variables!")
-
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ------------------- WEBSITE SCRAPER -------------------
-def scrape_website(link: str):
-    try:
-        response = requests.get(link, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        headings = [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2', 'h3'])]
-        paragraphs = [p.get_text(strip=True) for p in soup.find_all('p')]
-        content = "\n".join(paragraphs)
-        return {"headings": headings, "content": content}
-    except Exception as e:
-        return {"error": str(e)}
-
-# ------------------- HUGGING FACE SUMMARIZATION -------------------
 HF_MODEL = "sshleifer/distilbart-cnn-12-6"
 
+app = FastAPI()
+
+# ✅ CORS
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "https://yourfrontend.com",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------- PLAYWRIGHT SCRAPER -------------------
+async def scrape_website_playwright(base_url: str, max_depth=5, max_pages=100, max_time=180, delay=1):
+    visited = set()
+    headings_all = []
+    paragraphs_all = []
+    pages_scanned = 0
+    start_time = time.time()
+
+    async def crawl(url, depth):
+        nonlocal pages_scanned
+        if (
+            depth > max_depth
+            or url in visited
+            or pages_scanned >= max_pages
+            or time.time() - start_time > max_time
+        ):
+            return
+
+        visited.add(url)
+        pages_scanned += 1
+        logging.info(f"🔹 Crawling: {url} (Depth {depth})")
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url, timeout=30000)
+                await asyncio.sleep(delay)  # wait for JS to load
+                content = await page.content()
+                await browser.close()
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to load {url}: {e}")
+            return
+
+        soup = BeautifulSoup(content, "html.parser")
+        headings_all.extend([h.get_text(strip=True) for h in soup.find_all(['h1','h2','h3'])])
+        paragraphs_all.extend([p.get_text(strip=True) for p in soup.find_all('p')])
+
+        # internal links
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            full_url = urljoin(base_url, href)
+            if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                await crawl(full_url, depth + 1)
+
+    await crawl(base_url, 0)
+    content = "\n".join(paragraphs_all)
+    return {"headings": list(dict.fromkeys(headings_all)), "content": content}
+
+# ------------------- SUMMARIZATION -------------------
 def hf_summarize(text: str):
     url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
     headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
@@ -50,24 +107,22 @@ def hf_summarize(text: str):
 
 def chunk_text(text, chunk_size=800):
     words = text.split()
-    chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-    return chunks
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
 def nlp_extract_features(content: str):
     if not content:
         return []
     chunks = chunk_text(content)
     bullets = []
-    for chunk in chunks:
+    for chunk in chunks[:5]:  # limit for speed
         summary = hf_summarize(chunk)
         bullets.extend([s.strip() for s in summary.split('.') if s.strip()])
-    bullets = list(dict.fromkeys(bullets))
-    return bullets
+    return list(dict.fromkeys(bullets))
 
-# ------------------- LLM FORMATTING -------------------
+# ------------------- LLM MARKDOWN -------------------
 def llm_format_markdown(name, link, headings, features, summary):
     headings_text = "\n".join(headings) if headings else "No headings found."
-    features_text = "\n".join(features) if features else "No features extracted."
+    features_text = "\n".join(features) if features else "Not available."
     prompt = f"""
 You are a professional business analyst. 
 You are given raw competitor data and must generate a structured Markdown report.
@@ -86,11 +141,11 @@ Website Summary (raw content, may be messy):
 
 Task:
 - Generate a structured Markdown report with these sections:
-  1. **Overview** → Write a 2–3 sentence overview of the company.
-  2. **Products & Services** → List all products/services mentioned in headings/content. If none, write "Not available".
-  3. **Pricing** → If no pricing found, explicitly state "Not available on the website."
-  4. **Features / USPs** → Turn extracted features into clear bullet points. If none, say "Not available".
-  5. **Notes** → Add any insights, gaps, or observations.
+  1. **Overview** (2–3 sentences)
+  2. **Products & Services** (list or "Not available")
+  3. **Pricing** (or "Not available")
+  4. **Features / USPs** (bullet points or "Not available")
+  5. **Notes** (observations or gaps)
 
 Rules:
 - NEVER leave a section blank. Explicitly state "Not available" if missing.
@@ -99,22 +154,20 @@ Rules:
     try:
         response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         return response.candidates[0].content.parts[0].text
-    except Exception:
+    except Exception as e:
+        logging.error(f"Gemini failed: {e}")
         return "Error: Could not parse Gemini output."
 
-# ------------------- FULL PIPELINE -------------------
-def competitor_research(name: str, link: str):
+# ------------------- PIPELINE -------------------
+async def competitor_research(name: str, link: str):
     result = {"name": name, "link": link, "headings": [], "features": [], "summary": "", "markdown": ""}
-    scraped = scrape_website(link)
-    if "error" in scraped:
-        result["error"] = scraped["error"]
-        return result
+    scraped = await scrape_website_playwright(link)
     result["headings"] = scraped["headings"]
     result["summary"] = scraped["content"][:4000]
     result["features"] = nlp_extract_features(scraped["content"])
     result["markdown"] = llm_format_markdown(
-        name=result["name"],
-        link=result["link"],
+        name=name,
+        link=link,
         headings=result["headings"],
         features=result["features"],
         summary=result["summary"]
@@ -122,35 +175,12 @@ def competitor_research(name: str, link: str):
     return result
 
 # ------------------- FASTAPI -------------------
-app = FastAPI()
-
 @app.get("/markdown", response_class=PlainTextResponse)
-def get_markdown(
+async def get_markdown(
     name: str = Query(..., description="Competitor name"),
     link: str = Query(..., description="Competitor website URL")
 ):
-    research_result = competitor_research(name, link)
-    if "error" in research_result:
-        return f"Error: {research_result['error']}"
+    logging.info(f"📥 Request received: /markdown?name={name}&link={link}")
+    research_result = await competitor_research(name, link)
+    logging.info(f"✅ Successfully generated markdown for {name}")
     return research_result.get("markdown", "No markdown generated.")
-
-@app.get("/research")
-def get_full_research(
-    name: str = Query(..., description="Competitor name"),
-    link: str = Query(..., description="Competitor website URL")
-):
-    return competitor_research(name, link)
-
-@app.get("/test")
-def test():
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents="Respond with just 'ok'"
-    )
-    return {"result": response.candidates[0].content.parts[0].text}
-
-# ------------------- MAIN -------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
-
