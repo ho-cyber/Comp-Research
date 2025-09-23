@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # ------------------- PLAYWRIGHT SCRAPER -------------------
-async def scrape_website_playwright(base_url: str, max_depth=5, max_pages=100, max_time=180, delay=1):
+async def scrape_website_playwright(base_url: str, max_depth=20, max_pages=200, max_time=180, delay=1):
     visited = set()
     headings_all = []
     paragraphs_all = []
